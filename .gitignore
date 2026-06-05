@@ -1,0 +1,16 @@
+# virtualenv (don't commit — Streamlit Cloud installs from requirements.txt)
+datavis/
+
+# large raw climate downloads (only the pipeline needs these, not the app)
+data/
+
+# heavy pipeline byproducts the app doesn't load (regenerable via train_soil_temp.py)
+outputs/cells.parquet
+outputs/model.joblib
+outputs/predictions_grid.parquet
+outputs/points_predictions.csv
+
+python-cache/
+__pycache__/
+*.pyc
+.DS_Store
