@@ -612,8 +612,8 @@ st.markdown(
 # Title with the tagline inline beside it
 st.markdown(
     '<div class="app-title">Global Soil Temperatures'
-    '<span class="app-tagline">  —  projecting soil temperatures into the future, '
-    'and what they mean for us</span></div>',
+    '<span class="app-tagline">  —  how soil is warming, and what that means for '
+    'permafrost, farmland, and where we can live</span></div>',
     unsafe_allow_html=True,
 )
 
@@ -622,15 +622,38 @@ OVERLAY, POINTS, METRICS = load_outputs()
 if "active_focus" not in st.session_state:
     st.session_state.active_focus = "all"
 
-# --- Controls row: View · Future warming rate · Color ---
 MODEL_VIEW = "Model & projection"
 RAW_VIEW = "Raw dataset.csv only"
 COLOR_ABS = "Soil temp"
 COLOR_DELTA = "Change vs present"
-ctrl_view, ctrl_rate, ctrl_color = st.columns([3, 2, 2])
-with ctrl_view:
-    view = st.segmented_control("View", [RAW_VIEW, MODEL_VIEW], default=RAW_VIEW,
-                                key="view_mode")
+
+# Default to the model/projection view (the animated story), not the static data.
+view = st.segmented_control("View", [MODEL_VIEW, RAW_VIEW], default=MODEL_VIEW,
+                            key="view_mode")
+
+if view == RAW_VIEW:
+    render_raw_dataset()
+    st.stop()
+
+# --- Map, then focus tiles, then explanation, then details (model view) ---
+if OVERLAY is None or POINTS is None:
+    st.warning("Run `../datavis/bin/python train_soil_temp.py` first to generate "
+               "the prediction overlay and the per-year point data.")
+    st.stop()
+
+# How-to-read banner (so the map makes sense on arrival, no scrolling needed)
+st.markdown(
+    '<div class="app-sub"><b>How to read this:</b> the dots are the '
+    '<b>sites from dataset.csv</b>; the shading is the soil-temperature field '
+    'everywhere else — <b>real</b> annual soil temperatures up to ~2025, then the '
+    '<b>model\'s prediction</b>. Press <b>▶ Play</b> to sweep 1950 → 2080. Pick a '
+    '<b>focus</b> below to highlight permafrost, desertification, or habitability '
+    'risk.</div>',
+    unsafe_allow_html=True,
+)
+
+# Model-view controls (kept off the raw landing to reduce first-contact clutter)
+ctrl_rate, ctrl_color = st.columns(2)
 with ctrl_rate:
     rate = st.segmented_control(
         "Future warming rate", ["Recent 30-yr", "Long-term 50-yr"],
@@ -646,16 +669,6 @@ with ctrl_color:
              "warmed since ~2025 (Δ°C) — the change view makes the projected "
              "warming far easier to see than on the wide absolute scale.")
 
-if view == RAW_VIEW:
-    render_raw_dataset()
-    st.stop()
-
-# --- Map, then focus tiles, then explanation, then details (model view) ---
-if OVERLAY is None or POINTS is None:
-    st.warning("Run `../datavis/bin/python train_soil_temp.py` first to generate "
-               "the prediction overlay and the per-year point data.")
-    st.stop()
-
 active = FOCUS_BY_KEY[st.session_state.active_focus]
 rate_tag = "r50" if "50" in (rate or "") else "r30"
 ov_r = OVERLAY[OVERLAY["rate"].isin(["hist", rate_tag])]
@@ -663,13 +676,6 @@ pt_r = POINTS[POINTS["rate"].isin(["hist", rate_tag])]
 change_mode = color == COLOR_DELTA
 
 st.plotly_chart(build_animation(active, ov_r, pt_r, change_mode), width="stretch")
-st.markdown(
-    '<div class="app-sub">Restor sites (the dots) over a soil-temperature overlay. '
-    'Press ▶ Play to watch 1950 → 2080: dots and overlay recolor each year. '
-    'Years up to ~2025 show <b>real</b> NCEP soil temperature; later years are the '
-    '<b>model\'s projection</b> (expect a small step at the switch).</div>',
-    unsafe_allow_html=True,
-)
 
 # Focus tiles (set what the overlay shows) — directly under the map
 st.markdown('<div class="section-label">Focus presets — choose the overlay</div>',
