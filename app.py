@@ -15,6 +15,8 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
+from soil_stats import summary_stats, focus_summary_md
+
 # ---------------------------------------------------------------------------
 # 1. DATASETS
 # To add another dataset later, just add a line here:
@@ -88,11 +90,11 @@ indicator** that permafrost exists *at depth* — but it does **not** mean the
 ground is frozen year-round at the surface. The top **"active layer" still
 thaws every summer**, even where permafrost is present below; the annual *mean*
 stays sub-zero because the long, cold winter outweighs the short summer thaw, so
-heat never penetrates deep enough to thaw the layer beneath. 
+heat never penetrates deep enough to thaw the layer beneath.
 
 The areas shown in blue are where the annual mean soil temperature is below 0 °C
 in the selected year — **real NCEP data for past years**, the model's projection
-for future years. Treat this filter as **permafrost-favourable**, not confirmed:
+for future years. Treat this filter as **permafrost-favorable**, not confirmed:
 it's a 0–10 cm reading at coarse ~1.9° resolution, and a single annual mean can't
 verify the two-year part of the definition.
 
@@ -104,7 +106,7 @@ verify the two-year part of the definition.
   which drives further warming, which thaws more permafrost.
 - **Methane.** Much of the release is methane, a greenhouse gas dozens of times
   more potent than CO₂ over a 20-year span.
-- **Ground collapse.** Thawing destabilises the soil, causing subsidence,
+- **Ground collapse.** Thawing destabilizes the soil, causing subsidence,
   landslides ("thaw slumps"), and damage to roads, pipelines, and buildings.
 - **Ecosystem & hydrology shifts.** Drainage, wetlands, and habitats change as
   frozen ground gives way.
@@ -114,7 +116,7 @@ As the climate warms, these are the soils most at risk of crossing the 0 °C
 threshold — making this an early-warning map.
 """
 
-CROP_LIMIT_EXPLANATION = """
+HEAT_DESERTIFICATION_LIMIT_EXPLANATION = """
 Land drops out of food production when it gets **too hot or too dry** — so this
 filter scores each place on both and combines them (**0 = unfarmable, 1 = fine**):
 
@@ -127,91 +129,62 @@ Because they're **multiplied**, a place fails if *either* is near 0 — too hot,
 too dry, or both. And they reinforce each other: warmer air dries the soil faster,
 which is the compounding engine of **desertification**.
 
-The **red** shows where that score is near zero in the selected year. The headline
-is that it **spreads** toward 2080 — that growth is the desertification story.
+The **red** shows where that score is near zero in the selected year. The area **spreads**
+over time, reflecting the increasing risk of desertification.
 (Frozen ground is excluded, so cold deserts don't turn red.) Treat it as
 heat/desertification *risk*, not a hard line — the real limit also shifts with
 rainfall, irrigation, and soil.
 """
 
 HABITABILITY_EXPLANATION = """
-**The habitability index (0–1).** Each location gets three sub-scores, every one
-running from **0 (unsuitable)** to **1 (ideal)**, which we then multiply together:
+We build a simple, transparent habitability index (0–1) from the three climate limits
+that are most important for where humans settle. Each location gets three sub-scores,
+**0 (unsuitable)** to **1 (ideal)**, which we multiply together:
 
-- **Not too cold** — scores **0 when the soil is below freezing** (nothing grows in
-  frozen ground) and rises to **1** at mild temperatures.
-- **Not too hot** — scores **1** at mild temperatures and drops to **0 above
+- **Not too cold** — **0 when the soil is below freezing** and rises to **1** at mild temperatures.
+- **Not too hot** — **1** at mild temperatures and drops to **0 above
   ~29 °C**, the edge of the human climate niche (Xu et al. 2020).
-- **Moisture** — from the aridity index (rainfall ÷ evaporative demand): near
+- **Moisture for crops** — the aridity index (rainfall ÷ evaporative demand) captures whether there's enough water for plants to grow: near
   **0** in hyper-arid deserts, near **1** in humid climates (land counts as
   "dryland" below 0.65; UNCCD).
 
 Because the three are **multiplied**, a place needs *all three* to score well —
-not too cold, not too hot, **and** watered. If any one is near 0, the whole index
-is near 0. On the map, the **green shading is the model's habitability index for
+not too cold, not too hot, **and** watered. On the map, the **green shading is the model's habitability index for
 the selected year** — deeper green = more habitable — fading to nothing where
 land is too cold, too hot, or too dry.
 
-The headline of *this* filter is the **poleward shift**: unlike *Cropland heat
-limit* (heat & dryness only), habitability also counts **cold**, so as the
-climate warms you see the livable band **gain ground in the high north while
-losing it across the subtropics** — not just a hot edge expanding. Press Play to
-watch it move.
-
-It's a deliberately simple, transparent index (not a crop model). Checked against
-real ground truth, known farmland regions average **0.92** and barren deserts/ice
-**0.11**.
+The headline of *this* filter is the **poleward shift**: unlike the *heat & desertification* filter,
+habitability also counts **cold**, so as the
+climate warms you see the livable band **gain ground in the north while
+losing it across the subtropics**.
 """
 
 # The "All sites" tile doubles as the data/methodology panel.
 DATA_INFO = """
-**What this map shows.** Annual mean soil temperature across the globe — **real
-data up to ~2025, then a model's projection out to 2080.** Press ▶ Play to watch
-it change year by year.
+The highlighted dots on the map represent the 2,015 sites with multiyear annual soil temperatures from `dataset.csv`.
+To show how soil temperatures are changing over time in response to bioclimatic variables,
+we brought in more data from NCEP/NCAR Reanalysis. The annual soil temperatures in the new dataset are **monthly**
+fields, which we average — twelve months into one annual mean — for every land
+cell on its coarse ~1.9°, 0–10 cm grid for 1948–2025. Cells over the ocean are dropped — NCEP reports a surface value
+over sea ice, but that isn't a true soil temperature (counting it would inflate the permafrost area). The original 2,015 sites
+are incorporated in the new dataset by plugging in the annual mean soil temperatures of the closest NCEP land cells.
 
-**1 · The dots: Restor.** The 2,015 dots are real sites from
-[Restor](https://restor.eco) — our real-world anchor. But `dataset.csv` gives only
-*one* long-term average per site: too sparse to color a globe, and with no
-year-by-year history to show change over time.
+**Given a place's climate, what is its soil temperature?** To answer this question, we trained an
+**XGBoost** regressor on seven climate features built from NCEP air temperature and precipitation: mean annual air
+temperature, annual precipitation, temperature seasonality, warmest-month and
+coldest-month temperature, PET (Thornthwaite evaporative demand), and the aridity
+index (rainfall ÷ PET). The target variable is the real NCEP soil
+temperature. Every land cell in every year is one example — about 460,000 in all.
 
-**2 · Why we added NCEP data.** To get soil temperature *everywhere, every year*,
-we pulled in the **NCEP/NCAR Reanalysis** (NOAA PSL): gridded **monthly** soil
-temperature, air temperature, and precipitation, worldwide, **1948–2025**. We
-average each year's 12 months into annual values. This becomes the backbone of the
-map and the data the model learns from.
+Up to 2025, the map shows the actual measured soil temperatures. To reach a future year we project each climate feature's recent trend
+forward — the **Future warming rate** toggle chooses whether that trend is fit
+over the last 30 or 50 years — and feed that extrapolated future climate into the
+trained model, which returns the projected soil temperature. The projection is a
+straight-line trend extrapolation with no feedback physics: it doesn't account for the
+acceleration and compounding effects of climate change, so it is best read as a
+**floor, not a forecast**.
 
-**3 · The model (supervised learning).** We train an **XGBoost** model to answer
-one question: *given a place's climate, what is its soil temperature?* The
-**inputs** are 7 climate features (below) built from NCEP air temp + precip; the
-**answer it learns from** (the label) is the real NCEP soil temperature. Every
-land cell in every year 1948–2025 is one training example (~660,000), and we
-score it on **held-out years** so it reflects real prediction, not memorisation.
-
-**4 · Past = real, future = predicted.** Up to **~2025** the map shows the
-**actual** NCEP soil temperature — no model. From **2030** on it shows the
-**model's projection**. (A small step can appear at the hand-off; we leave it, to
-be honest about where measurement ends and prediction begins.)
-
-**5 · How the future is built.** The model only translates climate → soil temp,
-so to reach a future year we:
-1. **Project the climate forward** — for each place we measure how fast each
-   feature (temperature, rainfall, …) has changed recently and extend that trend
-   to the target year (the *30-yr* / *50-yr* toggle picks how fast).
-2. **Run the model on it** — feed that projected future climate into the trained
-   model, and it returns the projected soil temperature.
-So future soil temperatures are the model reading a trend-extrapolated future
-climate.
-
-**The 7 features** (per location, from NCEP air + precip): mean annual air
-temperature · annual precipitation · temperature seasonality · warmest-month
-temp · coldest-month temp · **PET** (Thornthwaite evaporative demand) ·
-**aridity index** (rainfall ÷ PET).
-
-**Worth knowing.** NCEP is a *reanalysis* (a weather model blended with
-observations), the 0–10 cm layer, on a coarse **~1.9°** grid. Air temperature is
-by far the strongest predictor — so the model's high accuracy is *expected
-physics*, not a discovery — and the future is a straight-line **trend
-extrapolation** with no feedback physics: read it as a floor, not a forecast.
+We leave the 2,015 sites from `dataset.csv` as reference points, so you can see how the soil temperatures at those locations are changing relative to the model's projection and the focus overlays.
 """
 
 DATA_SOURCES = [
@@ -232,17 +205,18 @@ FOCUSES = [
     {
         "key": "all",
         "label": "All sites",
-        "blurb": "Observed sites + about the data.",
-        # no shaded overlay — show the observed dots alone
-        "overlay": {"kind": "none"},
+        "blurb": "Soil-temp field + the real observed sites",
+        # full soil-temperature field behind the real observed dots
+        "overlay": {"kind": "field", "col": "soil_temp",
+                    "name": "soil temperature"},
         "explanation": DATA_INFO,
         "detail_images": [],
         "sources": DATA_SOURCES,
     },
     {
         "key": "permafrost",
-        "label": "Permafrost-favourable",
-        "blurb": "Blue: soil below 0 °C — shrinks over time.",
+        "label": "Permafrost-favorable",
+        "blurb": "Blue: soil below 0 °C — shrinks over time",
         # overlay: blue shaded fill where predicted soil temp < 0 (shrinks as it warms)
         "overlay": {"kind": "threshold", "col": "soil_temp", "thr": 0.0,
                     "fill": "33,102,172", "name": "soil temp < 0 °C"},
@@ -268,14 +242,14 @@ FOCUSES = [
     {
         "key": "crop_limit",
         "label": "Heat & desertification",
-        "blurb": "Red: land lost to heat + drought — spreads over time.",
+        "blurb": "Red: land lost to heat, drought — spreads over time",
         # overlay: red fill where heat+aridity suitability < 0.2 AND the ground is
         # warm (soil > 0 °C) — the gate keeps frozen polar/high deserts, which are
         # cold-limited not heat-limited, from showing up red.
         "overlay": {"kind": "threshold", "col": "heat_aridity", "thr": 0.2,
                     "gate_col": "soil_temp", "gate_min": 0.0,
                     "fill": "178,24,43", "name": "heat/aridity-limited"},
-        "explanation": CROP_LIMIT_EXPLANATION,
+        "explanation": HEAT_DESERTIFICATION_LIMIT_EXPLANATION,
         "detail_images": [
             ("images/cracked_dry_soil.jpg",
              "Cracked, desiccated ground — a hallmark of drought and "
@@ -299,7 +273,7 @@ FOCUSES = [
     {
         "key": "habitability",
         "label": "Habitability index",
-        "blurb": "Green: livable land — shifts poleward over time.",
+        "blurb": "Green: livable land — shifts poleward over time",
         # overlay: green shaded fill graded by the habitability index (0-1)
         "overlay": {"kind": "gradient", "col": "habitability", "fill": "0,104,55",
                     "name": "habitability"},
@@ -333,18 +307,22 @@ PROJECTION_INFO = """
 Soil temperature is real **NCEP/NCAR Reanalysis** data up to ~%d, then an
 **XGBoost** model's prediction (climate → soil temperature, run on each location's
 trend-extrapolated climate). Full walkthrough: open the **All sites** tile.
-
-⚠️ **Reading the skill numbers below:** the R² is very high mainly because soil
-temperature ≈ air temperature + a small offset — expected physics, not a
-discovery. Drop the air-temperature features and it collapses, confirming air
-temp is the dominant driver (which is why we keep it).
 """ % HIST_END
 
 
 
+def _outputs_sig():
+    """File mtimes of the pipeline outputs — used as a cache key so the
+    cached loaders refresh automatically whenever the pipeline regenerates."""
+    import os
+    return tuple(os.path.getmtime(f) if os.path.exists(f) else 0.0
+                 for f in (OVERLAY_PATH, POINTS_PATH, METRICS_PATH))
+
+
 @st.cache_data
-def load_outputs():
-    """Animated overlay grid + observed-point time series (None if pipeline unrun)."""
+def load_outputs(cache_key):
+    """Animated overlay grid + observed-point time series (None if pipeline
+    unrun). `cache_key` is the output-file mtimes (see _outputs_sig)."""
     import os
     import json
     if not (os.path.exists(OVERLAY_PATH) and os.path.exists(POINTS_PATH)):
@@ -365,8 +343,10 @@ def select_focus(focus):
     st.session_state.active_focus = focus["key"]
 
 
-def _overlay_trace(dfy, focus, ov_cbar=None):
-    """A transparent shaded FILL (density heatmap) for the focus, or None."""
+def _overlay_trace(dfy, focus):
+    """A transparent shaded FILL (density heatmap) for the focus, or None. The
+    fill carries no color bar of its own (showscale=False) — only the dots show a
+    scale, so nothing in the overlay flickers or reflows the map as years change."""
     ov = focus["overlay"]
     rgb = ov.get("fill")
     # transparent -> solid fill of the focus color (alpha encodes the value)
@@ -388,70 +368,73 @@ def _overlay_trace(dfy, focus, ov_cbar=None):
         return go.Densitymap(
             lat=dfy["lat"], lon=dfy["lon"], z=dfy[ov["col"]],
             radius=14, zmin=0, zmax=ov.get("zmax", 1.0), opacity=0.6,
-            colorscale=fade, showscale=ov_cbar is not None, colorbar=ov_cbar,
-            hoverinfo="skip", name=ov["name"],
+            colorscale=fade, showscale=False, hoverinfo="skip", name=ov["name"],
+        )
+    if ov["kind"] == "field":
+        # full modeled soil-temperature field as one translucent colored marker
+        # per grid cell (NOT a Densitymap, whose z accumulates and saturates).
+        # Shares the dots' temperature scale (coloraxis); real dots sit on top.
+        return go.Scattermap(
+            lat=dfy["lat"], lon=dfy["lon"], mode="markers",
+            marker=dict(size=ov.get("size", 5), color=dfy[ov["col"]],
+                        coloraxis="coloraxis", opacity=0.45),
+            hoverinfo="skip", name=ov.get("name", "field"),
         )
     return None
 
 
-def _points_trace(dfy, pts_cbar, pts_color):
-    """Observed-site dots — the only markers. `pts_color` sets the column +
-    color scale (absolute soil temp, or change-vs-present)."""
+def _points_trace(dfy, pts_color):
+    """Observed-site dots — the only markers. Color is driven by the layout-level
+    `coloraxis` (defined once), so the color bar stays put across frames."""
     return go.Scattermap(
         lat=dfy["lat"], lon=dfy["lon"], mode="markers", name="observed sites",
         text=dfy["hover"], hovertemplate="%{text}<extra></extra>",
         marker=dict(size=6, color=dfy[pts_color["col"]],
-                    colorscale=pts_color["scale"], cmin=pts_color["cmin"],
-                    cmax=pts_color["cmax"], opacity=1.0,
-                    showscale=True, colorbar=pts_cbar),
+                    coloraxis="coloraxis", opacity=1.0),
     )
 
 
-def _frame_traces(ov_df, pt_df, focus, pts_cbar, ov_cbar, pts_color):
-    """Traces for one year: shaded fill (if any) below the observed dots."""
-    fill = _overlay_trace(ov_df, focus, ov_cbar)
-    return ([fill] if fill is not None else []) + [_points_trace(pt_df, pts_cbar, pts_color)]
+def _points_outline_trace(dfy):
+    """A white halo drawn just behind the observed dots so they pop over the
+    soil-temp field and the overlays — an outline without enlarging the dot
+    (the size-6 colored dot is drawn on top of this size-10 white marker)."""
+    return go.Scattermap(
+        lat=dfy["lat"], lon=dfy["lon"], mode="markers",
+        marker=dict(size=8, color="white", opacity=1.0),
+        hoverinfo="skip", name="site outline",
+    )
 
 
-def build_animation(focus, overlay_df, points_df, change_mode=False):
-    """go.Figure with one frame per year: shaded fill + observed dots.
-    change_mode colors the dots by warming-since-present (Δ°C) instead of
-    absolute soil temperature, so the projected warming is visible."""
+def _frame_traces(ov_df, pt_df, focus, pts_color):
+    """Traces for one year: shaded fill (if any), then outlined observed dots."""
+    fill = _overlay_trace(ov_df, focus)
+    return (([fill] if fill is not None else [])
+            + [_points_outline_trace(pt_df), _points_trace(pt_df, pts_color)])
+
+
+def build_animation(focus, overlay_df, points_df):
+    """go.Figure with one frame per year: a shaded fill plus the observed dots,
+    colored by absolute soil temperature on one shared color axis."""
     years = sorted(overlay_df["year"].unique())
     start = 2020 if 2020 in years else years[0]
     ov_by = {y: overlay_df[overlay_df["year"] == y] for y in years}
 
-    # Dot color: absolute soil temp, or change-vs-present (Δ°C, diverging).
-    if change_mode:
-        base_yr = int(points_df.loc[~points_df["is_future"], "year"].max())
-        base = (points_df[points_df["year"] == base_yr][["lat", "lon", "soil_temp"]]
-                .drop_duplicates(["lat", "lon"]).rename(columns={"soil_temp": "_b"}))
-        points_df = points_df.merge(base, on=["lat", "lon"], how="left")
-        points_df["disp"] = points_df["soil_temp"] - points_df["_b"]
-        pts_color = dict(col="disp", scale="RdBu_r", cmin=-4, cmax=4)
-        cbar_title = f"Δ°C vs {base_yr}"
-    else:
-        points_df = points_df.copy()
-        points_df["disp"] = points_df["soil_temp"]
-        pts_color = dict(col="disp", scale=TS_SCALE, cmin=TS_MIN, cmax=TS_MAX)
-        cbar_title = "°C"
+    pts_color = dict(col="soil_temp", scale=TS_SCALE, cmin=TS_MIN, cmax=TS_MAX)
     pt_by = {y: points_df[points_df["year"] == y] for y in years}
 
-    # Legends: the dots carry the temp/Δ scale. A gradient overlay (habitability)
-    # adds a second 0-1 color bar placed SIDE BY SIDE with it.
-    is_grad = focus["overlay"]["kind"] == "gradient"
-    if is_grad:
-        pts_cbar = dict(title=cbar_title, x=1.01, xanchor="left", y=0.5,
-                        yanchor="middle", len=0.92)
-        ov_cbar = dict(title="Habitability", x=1.12, xanchor="left", y=0.5,
-                       yanchor="middle", len=0.92,
-                       tickmode="array", tickvals=[0, 0.25, 0.5, 0.75, 1.0])
-    else:
-        pts_cbar, ov_cbar = dict(title=cbar_title), None
+    # One color bar only — the dots' temperature scale. It lives in the layout
+    # (coloraxis) and is pinned to a fixed spot inside the reserved right margin,
+    # so its geometry never changes and can't reflow the map as the slider moves.
+    pts_cbar = dict(title="°C", x=1.0, xanchor="left", y=0.5,
+                    yanchor="middle", len=0.9, thickness=14)
 
     def label_for(y):
-        kind = "observed climate" if y <= HIST_END else "projected (trend)"
-        return f"<b>Year {int(y)} · {kind}</b>"
+        # future years emphasize the word "projected" in warm red so it's obvious
+        # the moment the visual crosses from real data into model predictions
+        if y <= HIST_END:
+            return f"<b>Year {int(y)} · observed climate</b>"
+        return (f"<b>Year {int(y)} · </b>"
+                f'<span style="color:#d6604d"><b>PROJECTED (trend)</b></span>')
 
     def ann(y):
         # bold dynamic label sitting just ABOVE the slider (bottom band)
@@ -461,22 +444,27 @@ def build_animation(focus, overlay_df, points_df, change_mode=False):
 
     frames = [
         go.Frame(name=str(y),
-                 data=_frame_traces(ov_by[y], pt_by[y], focus, pts_cbar, ov_cbar, pts_color),
+                 data=_frame_traces(ov_by[y], pt_by[y], focus, pts_color),
                  layout=go.Layout(annotations=[ann(y)]))
         for y in years
     ]
     fig = go.Figure(
-        data=_frame_traces(ov_by[start], pt_by[start], focus, pts_cbar, ov_cbar, pts_color),
+        data=_frame_traces(ov_by[start], pt_by[start], focus, pts_color),
         frames=frames)
 
     play = dict(frame=dict(duration=650, redraw=True),
-                transition=dict(duration=300), fromcurrent=True)
+                transition=dict(duration=0), fromcurrent=True)
+    coloraxis = dict(colorscale=pts_color["scale"], cmin=pts_color["cmin"],
+                     cmax=pts_color["cmax"], colorbar=pts_cbar)
     fig.update_layout(
         map=dict(style="carto-positron", zoom=0.7, center=dict(lat=25, lon=10)),
-        height=600, margin=dict(l=0, r=(95 if is_grad else 0), t=6, b=50),
+        # constant right margin reserves room for the one color bar; keeping it
+        # fixed (not conditional) stops the map from expanding/shrinking on redraw
+        height=600, margin=dict(l=0, r=70, t=6, b=50),
         annotations=[ann(start)],   # bold year · observed/projected, above the slider
         hoverlabel=dict(bgcolor="white", font_size=13, bordercolor="#d6604d"),
         uirevision="keep", showlegend=False,
+        coloraxis=coloraxis,
         updatemenus=[dict(
             type="buttons", direction="left", showactive=False,
             x=0.0, y=-0.08, xanchor="left", yanchor="top",
@@ -492,7 +480,7 @@ def build_animation(focus, overlay_df, points_df, change_mode=False):
             steps=[dict(method="animate", label=str(int(y)),
                         args=[[str(y)], dict(mode="immediate",
                                              frame=dict(duration=0, redraw=True),
-                                             transition=dict(duration=200))])
+                                             transition=dict(duration=0))])
                    for y in years])],
     )
     return fig
@@ -551,8 +539,8 @@ There are 2,015 rows with longitude, latitude, and **`AnnualTs`** with `AnnualTs
 **multi-year averages of annual soil temperatures** (°C, roughly −9.6 to 34).
 
 **Where this is going.** We bring in the **NCEP/NCAR Reanalysis** (NOAA PSL) —
-real **annual soil temperatures** plus air temperature and precipitation
-worldwide, 1948–2025 — and train a model on it to **predict soil temperatures
+real **soil temperatures** plus air temperature and precipitation
+worldwide from 1948–2025 — and train a model on it to **predict soil temperatures
 into the future**. Switch to **“Model & projection”** to see the real past, the
 future projection, the focus overlays, and the year-by-year animation.
 """
@@ -578,7 +566,7 @@ def render_raw_dataset():
     st.caption(f"Observed soil temperature — {len(df):,} sites · "
                "multi-year average, no model or projection.")
     st.markdown(RAW_INTRO)
-    with st.expander("Show dataset.csv"):
+    with st.expander("Show dataset.csv", expanded=True):
         st.dataframe(df[["latitude", "longitude", VALUE_COLUMN]], width="stretch")
 
 
@@ -596,14 +584,15 @@ st.markdown(
       .app-tagline { font-size: 1.1rem; font-weight: 400; color: #6b6b76; margin-left: 0.5rem; }
       .app-sub   { font-size: 0.95rem; color: #6b6b76; margin-bottom: 1rem; }
       .section-label { font-size: 0.9rem; font-weight: 700; color: #1c1c28; margin: 0.3rem 0 0.1rem; }
-      .tile-label { font-size: 1.0rem; font-weight: 700; color: #1c1c28; line-height: 1.15; }
-      .tile-blurb { font-size: 0.85rem; color: #6b6b76; min-height: 2.4em; line-height: 1.25; }
+      .tile-label { font-size: 1.0rem; font-weight: 700; color: #1c1c28; line-height: 1.1; margin: 0; }
+      .tile-blurb { font-size: 0.85rem; color: #6b6b76; min-height: 1.8em; line-height: 1.15; margin: 0; }
       div[data-testid="stExpander"] { border: none; }
       div[data-testid="stImage"] img { border-radius: 6px; }
       /* focus tiles: larger label/blurb text, smaller buttons */
-      div[data-testid="stVerticalBlockBorderWrapper"] { padding: 0.1rem; }
+      div[data-testid="stVerticalBlockBorderWrapper"] { padding: 0.35rem 0.5rem; }
+      div[data-testid="stVerticalBlockBorderWrapper"] div[data-testid="stVerticalBlock"] { gap: 0.25rem; }
       div[data-testid="stVerticalBlockBorderWrapper"] div[data-testid="stButton"] button {
-        padding: 0.0rem 0.3rem; font-size: 0.62rem; min-height: 0; line-height: 1.3; }
+        padding: 0.05rem 0.5rem; font-size: 0.7rem; min-height: 0; line-height: 1.1; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -612,24 +601,33 @@ st.markdown(
 # Title with the tagline inline beside it
 st.markdown(
     '<div class="app-title">Global Soil Temperatures'
-    '<span class="app-tagline">  —  how soil is warming, and what that means for '
-    'permafrost, farmland, and where we can live</span></div>',
+    '<span class="app-tagline">  —  how soil is warming and what that means for '
+    'permafrost, deserts, and where we can live</span></div>',
     unsafe_allow_html=True,
 )
 
 # Load model outputs once, and initialise the active focus
-OVERLAY, POINTS, METRICS = load_outputs()
+OVERLAY, POINTS, METRICS = load_outputs(_outputs_sig())
+SUMMARY = summary_stats(OVERLAY_PATH, _outputs_sig())
 if "active_focus" not in st.session_state:
     st.session_state.active_focus = "all"
 
 MODEL_VIEW = "Model & projection"
 RAW_VIEW = "Raw dataset.csv only"
-COLOR_ABS = "Soil temp"
-COLOR_DELTA = "Change vs present"
 
-# Default to the model/projection view (the animated story), not the static data.
-view = st.segmented_control("View", [MODEL_VIEW, RAW_VIEW], default=MODEL_VIEW,
-                            key="view_mode")
+# View + future warming rate share the top row (model defaults to the animated story).
+ctrl_view, ctrl_rate = st.columns(2)
+with ctrl_view:
+    view = st.segmented_control("View", [MODEL_VIEW, RAW_VIEW], default=MODEL_VIEW,
+                                key="view_mode")
+with ctrl_rate:
+    rate = st.segmented_control(
+        "Future warming rate", ["Recent 30-yr", "Long-term 50-yr"],
+        default="Recent 30-yr", key="rate_mode",
+        help="Which past trend we extend into the future — the recent 30-yr "
+             "(1996–2025) or the longer 50-yr (1976–2025). Only affects projected "
+             "years; the past is real either way. (See the note under the trend "
+             "chart for what the two rates mean.)")
 
 if view == RAW_VIEW:
     render_raw_dataset()
@@ -643,39 +641,34 @@ if OVERLAY is None or POINTS is None:
 
 # How-to-read banner (so the map makes sense on arrival, no scrolling needed)
 st.markdown(
-    '<div class="app-sub"><b>How to read this:</b> the dots are the '
-    '<b>sites from dataset.csv</b>; the shading is the soil-temperature field '
-    'everywhere else — <b>real</b> annual soil temperatures up to ~2025, then the '
-    '<b>model\'s prediction</b>. Press <b>▶ Play</b> to sweep 1950 → 2080. Pick a '
-    '<b>focus</b> below to highlight permafrost, desertification, or habitability '
-    'risk.</div>',
+    """<div class='app-sub'>Soil temperature shapes whether permafrost stays \
+frozen, how long the growing season lasts, and where land remains habitable — \
+yet it is rarely mapped as carefully as air temperature. Our starting point is \
+<code>dataset.csv</code> provided by \
+<a href='https://restor.eco' target='_blank'>Restor</a>, which has 2,015 rows with \
+<code>latitude</code>, <code>longitude</code>, and <code>AnnualTs</code> — a multiyear \
+average of annual soil temperatures. We bring in \
+<a href='https://psl.noaa.gov/data/gridded/data.ncep.reanalysis.html' target='_blank'>\
+NCEP/NCAR Reanalysis (NOAA PSL)</a> — real soil temperatures plus air temperature and \
+precipitation worldwide from 1948–2025 — to \
+train a supervised model to predict annual soil temperatures from bioclimatic \
+variables. The map shows soil temperatures rising, permafrost zones retreating, \
+desert regions growing, and habitable areas shifting polewards by 2080. Use the \
+map below to explore real mean annual soil temperature from 1950 to 2025 and \
+projected temperatures until 2080. Select a focus filter to see the shift of \
+permafrost, desert, and habitable zones. Press ▶ Play to watch it change year by year. </div>""",
     unsafe_allow_html=True,
 )
-
-# Model-view controls (kept off the raw landing to reduce first-contact clutter)
-ctrl_rate, ctrl_color = st.columns(2)
-with ctrl_rate:
-    rate = st.segmented_control(
-        "Future warming rate", ["Recent 30-yr", "Long-term 50-yr"],
-        default="Recent 30-yr", key="rate_mode",
-        help="Which past trend we extend into the future — the recent 30-yr "
-             "(1996–2025) or the longer 50-yr (1976–2025). Only affects projected "
-             "years; the past is real either way. (See the note under the trend "
-             "chart for what the two rates mean.)")
-with ctrl_color:
-    color = st.segmented_control(
-        "Color", [COLOR_ABS, COLOR_DELTA], default=COLOR_ABS, key="color_mode",
-        help="Color the dots by absolute soil temperature, or by how much they've "
-             "warmed since ~2025 (Δ°C) — the change view makes the projected "
-             "warming far easier to see than on the wide absolute scale.")
 
 active = FOCUS_BY_KEY[st.session_state.active_focus]
 rate_tag = "r50" if "50" in (rate or "") else "r30"
 ov_r = OVERLAY[OVERLAY["rate"].isin(["hist", rate_tag])]
 pt_r = POINTS[POINTS["rate"].isin(["hist", rate_tag])]
-change_mode = color == COLOR_DELTA
 
-st.plotly_chart(build_animation(active, ov_r, pt_r, change_mode), width="stretch")
+# responsive=False stops Plotly from recomputing the chart size on every frame
+# redraw (that recompute was the map "resizing" as you scrubbed the slider)
+st.plotly_chart(build_animation(active, ov_r, pt_r), width="stretch",
+                config={"responsive": False})
 
 # Focus tiles (set what the overlay shows) — directly under the map
 st.markdown('<div class="section-label">Focus presets — choose the overlay</div>',
@@ -699,6 +692,9 @@ if active["explanation"]:
     text_col, img_col = st.columns([3, 2])
     with text_col:
         st.markdown(f"#### {active['label']}")
+        _summary = focus_summary_md(active["key"], rate_tag, SUMMARY)
+        if _summary:
+            st.info(_summary)
         st.markdown(active["explanation"])
         if active.get("sources"):
             st.markdown(f"**Sources:** {sources_md(active['sources'])}")
@@ -708,10 +704,12 @@ if active["explanation"]:
             # real past + both projection rates as a shaded range
             st.plotly_chart(make_trend_chart(OVERLAY), width="stretch")
             st.caption(
-                "The shaded band spans two trend fits — the recent **30-yr** "
-                "(1996–2025) and the longer **50-yr** (1976–2025); which is "
-                "steeper depends on the location. Both are **straight-line "
-                "extrapolations** that ignore the acceleration and compounding "
+                "The **Future warming rate** toggle (top of the page) picks which "
+                "past trend the map projects forward: **Recent 30-yr** (1996–2025) "
+                "or **Long-term 50-yr** (1976–2025). The shaded band here shows "
+                "*both* at once, so you can see the spread — which one runs steeper "
+                "depends on the location. Either way it's a **straight-line "
+                "extrapolation** that ignores the acceleration and compounding "
                 "feedbacks of climate change (melting ice, permafrost carbon, "
                 "weaker ocean uptake, fires), so the real future likely runs "
                 "hotter — treat these projections as a **floor, not a forecast**.")
@@ -731,7 +729,20 @@ with st.expander("How the projection is made and model details", expanded=True):
             f"(RMSE {METRICS.get('soil_temp_cv_rmse_without_airtemp')} °C) — air "
             f"temperature is the dominant driver."
         )
-        n = METRICS.get("n_train_rows")
-        if n:
-            line += f" Trained on **{n:,} cell-years** ({METRICS.get('train_years')})."
         st.markdown(line)
+        st.markdown(
+            "R² is very high mainly because soil temperature ≈ air temperature + a "
+            "small offset. Even though leaving air temperature in the model makes the "
+            "regression somewhat trivial for predicting soil temperatures in the past, "
+            "we are interested in the best possible soil temperatures predictions into the future.")
+        n = METRICS.get("n_train_rows")
+        ty = METRICS.get("train_years", "")
+        if n:
+            span = ""
+            if "-" in ty:
+                a, b = ty.split("-")
+                yrs = int(b) - int(a) + 1
+                span = f" (~{n // yrs:,} land grid cells × {yrs} years)"
+            st.markdown(
+                f"**Trained on {n:,} data points** — one per land grid cell per "
+                f"year across {ty}{span}.")

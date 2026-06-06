@@ -1,9 +1,9 @@
 {
-  "soil_temp_cv_r2_with_airtemp": 0.984,
-  "soil_temp_cv_rmse_with_airtemp": 3.55,
-  "soil_temp_cv_r2_without_airtemp": 0.853,
-  "soil_temp_cv_rmse_without_airtemp": 10.75,
-  "n_train_rows": 663156,
+  "soil_temp_cv_r2_with_airtemp": 0.995,
+  "soil_temp_cv_rmse_with_airtemp": 2.4,
+  "soil_temp_cv_r2_without_airtemp": 0.963,
+  "soil_temp_cv_rmse_without_airtemp": 6.45,
+  "n_train_rows": 461292,
   "train_years": "1948-2025",
   "grid": "NCEP ~1.9 deg"
 }

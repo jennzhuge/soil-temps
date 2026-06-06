@@ -1,14 +1,13 @@
 """
 Soil-temperature pipeline — real past (NCEP) + supervised future projection.
 
-WHAT THIS DOES
   1. Loads NCEP/NCAR Reanalysis monthly fields (all ~1.9° global, 1948-2025,
      same grid): soil temperature (0-10 cm), 2 m air temperature, precipitation.
   2. Derives bioclim-style FEATURES from air + precip (the model inputs) and uses
      the real annual-mean SOIL temperature as the label.
   3. Trains an XGBoost model on the WHOLE land grid x all years (1948-2025),
      validated by held-out years (GroupKFold by year — honest given that
-     neighbouring cells/years are correlated).
+     neighboring cells/years are correlated).
   4. PAST years (1950-2025) show the *real* NCEP soil temperature.
   5. FUTURE years (2030-2080) extrapolate each feature's recent trend forward and
      run the model on it (no anchoring — a small step at the real->predicted
@@ -33,6 +32,7 @@ from soil_lib import FEATURE_COLS, habitability, heat_aridity_suit
 SOIL_NC = "data/tmp.0-10cm.mon.mean.nc"     # label: 0-10 cm soil temperature (K)
 AIR_NC = "data/air.2m.mon.mean.nc"          # feature: 2 m air temperature (K)
 PRATE_NC = "data/prate.sfc.mon.mean.nc"     # feature: precip rate (kg/m^2/s)
+LAND_NC = "data/land.sfc.gauss.nc"          # NCEP land/sea mask (1=land, 0=ocean)
 OBS_CSV = "dataset.csv"                      # Restor sites (coordinates only)
 OUT_DIR = "outputs"
 
@@ -146,7 +146,11 @@ def main():
     print("Building features + annual soil temperature...")
     feats = build_features(T, P, lat)
     soil = np.nanmean(Ts, axis=1)                       # (nyear, nlat, nlon) degC
-    landmask = np.isfinite(soil).all(axis=0)            # cells with soil every year
+    # Land mask = NCEP land/sea mask AND a finite soil value every year. The
+    # land/sea mask is essential: NCEP reports a "soil temperature" over Arctic
+    # sea-ice, so finiteness alone would wrongly keep Arctic Ocean cells.
+    land = xr.open_dataset(LAND_NC)["land"].values.squeeze() > 0.5
+    landmask = np.isfinite(soil).all(axis=0) & land
     print(f"  {int(landmask.sum())} land cells of {landmask.size}")
 
     # ---- Training table: land cells x years ----
