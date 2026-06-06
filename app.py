@@ -715,15 +715,17 @@ if active["explanation"]:
 # Method recap + model skill (always shown; sources live in the All-sites panel)
 with st.expander("How the projection is made and model details", expanded=True):
     st.markdown(PROJECTION_INFO)
-    if METRICS:
-        st.markdown(
+    if METRICS.get("soil_temp_cv_r2_with_airtemp") is not None:
+        line = (
             f"**Model skill (held-out-year CV):** soil-temp R² "
             f"**{METRICS.get('soil_temp_cv_r2_with_airtemp')}** "
             f"(RMSE {METRICS.get('soil_temp_cv_rmse_with_airtemp')} °C); "
             f"without the air-temp features it falls to R² "
             f"**{METRICS.get('soil_temp_cv_r2_without_airtemp')}** "
             f"(RMSE {METRICS.get('soil_temp_cv_rmse_without_airtemp')} °C) — air "
-            f"temperature is the dominant driver. Trained on "
-            f"**{METRICS.get('n_train_rows'):,} cell-years** "
-            f"({METRICS.get('train_years')})."
+            f"temperature is the dominant driver."
         )
+        n = METRICS.get("n_train_rows")
+        if n:
+            line += f" Trained on **{n:,} cell-years** ({METRICS.get('train_years')})."
+        st.markdown(line)
