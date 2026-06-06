@@ -1,31 +1,12 @@
 """
-Shared logic used by BOTH train_soil_temp.py (the pipeline) and app.py (the UI),
-so the year slider in the app computes exactly what the pipeline trained on.
+Shared model logic for the soil-temperature pipeline (train_soil_temp.py):
+the climate features the model is trained on, and the habitability sub-scores.
 """
 
 import numpy as np
 
 # Climate feature columns fed to the soil-temperature model, in fixed order.
 FEATURE_COLS = ["tmean", "pann", "tseason", "twarm", "tcold", "pet", "ai"]
-
-# The present baseline is the mean of 1988-2017, i.e. centred on this year.
-# A slider year of BASELINE_MID reproduces "present"; later years extrapolate.
-BASELINE_START = 1988
-YEAR_END = 2017
-BASELINE_MID = (BASELINE_START + YEAR_END) / 2.0   # 2002.5
-
-
-def project_features(base, slope, year):
-    """
-    Project each feature to `year` by linear extrapolation of its warming rate:
-        value(year) = baseline + slope * (year - BASELINE_MID)
-    `base` and `slope` are dicts (or DataFrame-like) of arrays keyed by FEATURE_COLS.
-    """
-    dt = year - BASELINE_MID
-    out = {k: base[k] + slope[k] * dt for k in FEATURE_COLS}
-    out["ai"] = np.clip(out["ai"], 0, 3.0)            # aridity index stays physical
-    out["pann"] = np.clip(out["pann"], 0, None)       # precipitation >= 0
-    return out
 
 
 def _cold_suit(tmean):

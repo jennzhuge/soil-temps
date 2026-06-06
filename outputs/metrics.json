@@ -1,12 +1,9 @@
 {
-  "soil_temp_cv_r2_with_airtemp": 0.899,
-  "soil_temp_cv_rmse_with_airtemp": 2.04,
-  "soil_temp_cv_r2_without_airtemp": 0.89,
-  "soil_temp_cv_rmse_without_airtemp": 2.13,
-  "habitability_validation_mean_farmland": 0.917,
-  "habitability_validation_mean_barren": 0.114,
-  "habitability_validation_separation": 0.803,
-  "future_year": 2070,
-  "baseline_period": "1988-2017",
-  "n_obs_used": 1947
+  "soil_temp_cv_r2_with_airtemp": 0.984,
+  "soil_temp_cv_rmse_with_airtemp": 3.55,
+  "soil_temp_cv_r2_without_airtemp": 0.853,
+  "soil_temp_cv_rmse_without_airtemp": 10.75,
+  "n_train_rows": 663156,
+  "train_years": "1948-2025",
+  "grid": "NCEP ~1.9 deg"
 }

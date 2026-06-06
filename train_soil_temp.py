@@ -1,123 +1,107 @@
 """
-Soil-temperature & habitability pipeline with future projection.
+Soil-temperature pipeline — real past (NCEP) + supervised future projection.
 
 WHAT THIS DOES
-  1. Loads 50 years (1968-2017) of monthly air-temperature and precipitation
-     (UDel, 0.5 deg, land only; cached in data/).
-  2. Derives bioclim-style annual features per year, including a Thornthwaite
-     potential-evapotranspiration (PET) estimate and an aridity index AI = P/PET.
-  3. Computes a present-day baseline (mean of 1988-2017) and a per-pixel warming
-     *rate* (linear OLS slope) over two windows:
-         - recent 30 yr (1988-2017)  -> headline (faster, recent rate)
-         - full   50 yr (1968-2017)  -> conservative low estimate
-     and projects each feature to ~2070 (trend extrapolation, see CAVEATS).
-  4. Trains a gradient-boosting model to predict observed annual soil temperature
-     (dataset.csv) from the climate features. Reports skill WITH and WITHOUT the
-     air-temperature feature (the air<->soil temp link is near-circular).
-  5. Builds a transparent heat + aridity HABITABILITY index (0-1) and validates
-     it against known agricultural vs barren reference regions.
-  6. Predicts soil temp & habitability on the global land grid for the present
-     and the ~2070 projection, and writes outputs/ (parquet + csv + PNG maps).
-
-CAVEATS (also surfaced in the app):
-  - Trend extrapolation assumes the recent warming RATE simply continues. It has
-    no physics; it cannot capture acceleration or uneven (Arctic-amplified)
-    warming the way scenario models (CMIP6) would. The 30yr/50yr pair is shown
-    as a low-high range rather than a single line.
-  - The model learned today is assumed to still hold in the future (stationarity).
-  - UDel is land-only at 0.5 deg; the soil-temp obs year/depth is unknown.
+  1. Loads NCEP/NCAR Reanalysis monthly fields (all ~1.9° global, 1948-2025,
+     same grid): soil temperature (0-10 cm), 2 m air temperature, precipitation.
+  2. Derives bioclim-style FEATURES from air + precip (the model inputs) and uses
+     the real annual-mean SOIL temperature as the label.
+  3. Trains an XGBoost model on the WHOLE land grid x all years (1948-2025),
+     validated by held-out years (GroupKFold by year — honest given that
+     neighbouring cells/years are correlated).
+  4. PAST years (1950-2025) show the *real* NCEP soil temperature.
+  5. FUTURE years (2030-2080) extrapolate each feature's recent trend forward and
+     run the model on it (no anchoring — a small step at the real->predicted
+     switch is expected and left as-is).
+  6. Writes outputs/ (overlay grid + observed-point series + metrics) on the
+     native NCEP grid.
 
 Run:  ../datavis/bin/python train_soil_temp.py
 """
 
 import json
+import os
 import numpy as np
 import pandas as pd
 import xarray as xr
 
-from soil_lib import FEATURE_COLS, habitability, heat_aridity_suit  # shared with app.py
+from soil_lib import FEATURE_COLS, habitability, heat_aridity_suit
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-AIR_NC = "data/air.mon.mean.v501.nc"
-PRECIP_NC = "data/precip.mon.total.v501.nc"
-OBS_CSV = "dataset.csv"
+SOIL_NC = "data/tmp.0-10cm.mon.mean.nc"     # label: 0-10 cm soil temperature (K)
+AIR_NC = "data/air.2m.mon.mean.nc"          # feature: 2 m air temperature (K)
+PRATE_NC = "data/prate.sfc.mon.mean.nc"     # feature: precip rate (kg/m^2/s)
+OBS_CSV = "dataset.csv"                      # Restor sites (coordinates only)
 OUT_DIR = "outputs"
 
-YEAR_START, YEAR_END = 1968, 2017      # 50-year window
-BASELINE_START = 1988                  # recent 30-yr baseline (present)
-FUTURE_YEAR = 2070
-BASELINE_MID = (BASELINE_START + YEAR_END) / 2.0   # ~2002.5
-DELTA_YEARS = FUTURE_YEAR - BASELINE_MID            # ~67.5
+YEAR_START, YEAR_END = 1948, 2025            # full-year training/real range
+BASELINE_START = 1996                        # recent 30-yr window -> "present" ~2025
+BASELINE_MID = (BASELINE_START + YEAR_END) / 2.0    # 2010.5
+RATE50_START = 1976                          # full 50-yr window
+
+HIST_YEARS = list(range(1950, YEAR_END + 1, 5))      # real soil temp
+FUT_YEARS = list(range(2030, 2081, 5))               # projected
 
 DAYS_IN_MONTH = np.array([31, 28.25, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31])
 MONTH_MID_DOY = np.array([15, 45, 74, 105, 135, 162, 198, 228, 258, 288, 318, 344])
 
 
 # ---------------------------------------------------------------------------
-# 1. Load monthly climate (sliced & in-memory)
+# 1. Load monthly NCEP fields, sliced & unit-converted, as (nyear, 12, lat, lon)
 # ---------------------------------------------------------------------------
 def load_monthly():
-    air = xr.open_dataset(AIR_NC)["air"].sel(
-        time=slice(f"{YEAR_START}", f"{YEAR_END}")).load()          # degC
-    pre = xr.open_dataset(PRECIP_NC)["precip"].sel(
-        time=slice(f"{YEAR_START}", f"{YEAR_END}")).load() * 10.0    # cm -> mm
-    lat = air["lat"].values
-    lon = air["lon"].values
+    sl = slice(f"{YEAR_START}", f"{YEAR_END}")
+    soil = xr.open_dataset(SOIL_NC)["tmp"].sel(time=sl).load() - 273.15      # degC
+    air = xr.open_dataset(AIR_NC)["air"].sel(time=sl).load() - 273.15        # degC
+    prate = xr.open_dataset(PRATE_NC)["prate"].sel(time=sl).load()           # kg/m2/s
+    lat, lon = soil["lat"].values, soil["lon"].values
     nyear = YEAR_END - YEAR_START + 1
-    # (nyear, 12, lat, lon)
-    T = air.values.reshape(nyear, 12, lat.size, lon.size)
-    P = pre.values.reshape(nyear, 12, lat.size, lon.size)
-    return T, P, lat, lon
+    shp = (nyear, 12, lat.size, lon.size)
+    T = air.values.reshape(shp)
+    Ts = soil.values.reshape(shp)
+    # precip rate -> monthly total mm (1 kg/m2 == 1 mm); rate * seconds in month
+    secs = (DAYS_IN_MONTH * 86400.0)[None, :, None, None]
+    P = prate.values.reshape(shp) * secs
+    return T, P, Ts, lat, lon
 
 
 # ---------------------------------------------------------------------------
-# 2. Thornthwaite PET (mm/yr), vectorised over (lat, lon) for one year
+# 2. Thornthwaite PET (mm/yr) for one year, vectorised over (lat, lon)
 # ---------------------------------------------------------------------------
 def daylight_hours(lat):
-    """Mean daylight hours per month -> (12, nlat)."""
-    lat_rad = np.radians(lat)[None, :]                       # (1, nlat)
+    lat_rad = np.radians(lat)[None, :]
     decl = 0.409 * np.sin(2 * np.pi * MONTH_MID_DOY / 365.0 - 1.39)[:, None]
-    x = np.clip(-np.tan(lat_rad) * np.tan(decl), -1, 1)
-    ws = np.arccos(x)                                        # sunset hour angle
-    return 24.0 / np.pi * ws                                 # (12, nlat)
+    ws = np.arccos(np.clip(-np.tan(lat_rad) * np.tan(decl), -1, 1))
+    return 24.0 / np.pi * ws                                # (12, nlat)
 
 
 def pet_year(Tm, daylen):
-    """
-    Tm: (12, nlat, nlon) monthly mean temp. daylen: (12, nlat).
-    Returns annual PET (nlat, nlon) in mm.
-    """
     Tpos = np.clip(Tm, 0, None)
-    heat_index = np.sum((Tpos / 5.0) ** 1.514, axis=0)       # (nlat, nlon)
-    I = heat_index
-    a = (6.75e-7 * I**3 - 7.71e-5 * I**2 + 1.792e-2 * I + 0.49239)
+    I = np.sum((Tpos / 5.0) ** 1.514, axis=0)
+    a = 6.75e-7 * I**3 - 7.71e-5 * I**2 + 1.792e-2 * I + 0.49239
     Isafe = np.where(I <= 0, np.nan, I)
-
-    daylen3 = daylen[:, :, None]                             # (12, nlat, 1)
-    corr = (daylen3 / 12.0) * (DAYS_IN_MONTH[:, None, None] / 30.0)
-
+    corr = (daylen[:, :, None] / 12.0) * (DAYS_IN_MONTH[:, None, None] / 30.0)
     with np.errstate(invalid="ignore", divide="ignore"):
-        unadj = 16.0 * (10.0 * Tm / Isafe[None]) ** a[None]  # standard 0<T<26.5
-    hot = -415.85 + 32.24 * Tm - 0.43 * Tm**2                # T >= 26.5 plateau
+        unadj = 16.0 * (10.0 * Tm / Isafe[None]) ** a[None]
+    hot = -415.85 + 32.24 * Tm - 0.43 * Tm**2
     monthly = np.where(Tm <= 0, 0.0, np.where(Tm < 26.5, unadj, hot))
     monthly = np.where(np.isfinite(monthly), monthly, 0.0)
-    pet = np.sum(monthly * corr, axis=0)                     # (nlat, nlon)
-    pet = np.where(I <= 0, 0.0, pet)
-    return pet
+    pet = np.sum(monthly * corr, axis=0)
+    return np.where(I <= 0, 0.0, pet)
 
 
 # ---------------------------------------------------------------------------
-# 3. Build per-year feature stack -> dict of (nyear, nlat, nlon)
+# 3. Per-year features (nyear, nlat, nlon) from air + precip
 # ---------------------------------------------------------------------------
 def build_features(T, P, lat):
     nyear = T.shape[0]
     daylen = daylight_hours(lat)
     feats = {k: np.full((nyear, lat.size, T.shape[3]), np.nan, dtype="float32")
-             for k in ["tmean", "pann", "tseason", "twarm", "tcold", "pet", "ai"]}
+             for k in FEATURE_COLS}
     for y in range(nyear):
-        Tm, Pm = T[y], P[y]                                  # (12, nlat, nlon)
+        Tm, Pm = T[y], P[y]
         feats["tmean"][y] = Tm.mean(0)
         feats["pann"][y] = Pm.sum(0)
         feats["tseason"][y] = Tm.std(0)
@@ -132,300 +116,161 @@ def build_features(T, P, lat):
 
 
 def ols_slope(stack, years):
-    """Per-pixel linear slope (units/yr). stack (nyear, nlat, nlon)."""
-    ny, nlat, nlon = stack.shape
-    Y = stack.reshape(ny, -1)                                # (nyear, npix)
-    x = years.astype("float64")
+    """Per-pixel linear slope (units/yr) over the given years."""
+    ny = stack.shape[0]
+    Y = stack.reshape(ny, -1)
     valid = np.isfinite(Y).all(axis=0)
     slope = np.full(Y.shape[1], np.nan)
     if valid.any():
-        coef = np.polyfit(x, Y[:, valid].astype("float64"), 1)  # [slope, intercept]
-        slope[valid] = coef[0]
-    return slope.reshape(nlat, nlon)
+        slope[valid] = np.polyfit(years.astype("float64"),
+                                  Y[:, valid].astype("float64"), 1)[0]
+    return slope.reshape(stack.shape[1:])
 
 
-# ---------------------------------------------------------------------------
-# 4. Reference-region validation (real-world ground truth, no big download)
-#    (the habitability index itself lives in soil_lib.py, shared with the app)
-# ---------------------------------------------------------------------------
-# (lat, lon, label, expect_high)  -- expect_high True = productive farmland
-REFERENCE_REGIONS = [
-    (42.0, -93.0, "Iowa Corn Belt (US)", True),
-    (49.0, 32.0, "Ukraine wheat belt", True),
-    (52.0, 0.5, "England (UK)", True),
-    (-34.0, -60.0, "Argentine Pampas", True),
-    (28.0, 77.0, "Indo-Gangetic Plain", True),
-    (45.0, 5.0, "France (Rhone)", True),
-    (23.0, 13.0, "Central Sahara", False),
-    (20.0, 45.0, "Rub al Khali (Arabia)", False),
-    (42.0, 105.0, "Gobi Desert", False),
-    (-24.0, 124.0, "Australian interior", False),
-    (76.0, -42.0, "Greenland interior", False),
-    (-23.0, -68.0, "Atacama Desert", False),
-]
-
-
-def sample_grid(field, lat, lon, plat, plon):
-    """Nearest-cell sample of a (nlat, nlon) field at point arrays."""
-    plon360 = np.mod(plon, 360.0)
-    ilat = np.clip(np.round((plat - lat[0]) / (lat[1] - lat[0])).astype(int), 0, lat.size - 1)
-    ilon = np.clip(np.round((plon360 - lon[0]) / (lon[1] - lon[0])).astype(int), 0, lon.size - 1)
-    return field[ilat, ilon]
+def nearest_idx(lat, lon, plat, plon):
+    """Nearest NCEP cell indices for point arrays (lat is Gaussian, lon 0-360)."""
+    ilat = np.abs(lat[None, :] - plat[:, None]).argmin(1)
+    ilon = np.abs(lon[None, :] - np.mod(plon, 360.0)[:, None]).argmin(1)
+    return ilat, ilon
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    import os
     os.makedirs(OUT_DIR, exist_ok=True)
-
-    print("Loading monthly climate (1968-2017)...")
-    T, P, lat, lon = load_monthly()
+    print("Loading NCEP monthly fields (1948-2025)...")
+    T, P, Ts, lat, lon = load_monthly()
     years = np.arange(YEAR_START, YEAR_END + 1)
 
-    print("Building annual features + Thornthwaite PET...")
+    print("Building features + annual soil temperature...")
     feats = build_features(T, P, lat)
+    soil = np.nanmean(Ts, axis=1)                       # (nyear, nlat, nlon) degC
+    landmask = np.isfinite(soil).all(axis=0)            # cells with soil every year
+    print(f"  {int(landmask.sum())} land cells of {landmask.size}")
 
-    # Present baseline = mean over recent 30 yr (1988-2017). Ocean cells are all
-    # NaN -> the empty-slice warning is expected and harmless, so silence it.
-    import warnings
-    bmask = years >= BASELINE_START
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=RuntimeWarning)
-        base = {k: np.nanmean(v[bmask], axis=0) for k, v in feats.items()}
+    # ---- Training table: land cells x years ----
+    feat_stack = np.stack([feats[k] for k in FEATURE_COLS], axis=-1)  # (ny,lat,lon,7)
+    yr_grid = np.repeat(years, int(landmask.sum()))     # group label per row
+    X = feat_stack[:, landmask, :].reshape(-1, len(FEATURE_COLS))
+    y = soil[:, landmask].reshape(-1)
+    ok = np.isfinite(y)                                 # all land/years are finite
+    X, y, groups = X[ok], y[ok], yr_grid[ok]
+    print(f"  training rows: {len(y):,}")
 
-    # Warming/feature rates (per yr): recent 30yr (headline) and full 50yr (low)
-    print("Fitting per-pixel trends (30 yr headline, 50 yr conservative)...")
-    slope30 = {k: ols_slope(feats[k][bmask], years[bmask]) for k in feats}
-    slope50 = {k: ols_slope(feats[k], years) for k in feats}
-
-    def project(slope):
-        fut = {k: base[k] + slope[k] * DELTA_YEARS for k in base}
-        # AI must stay physical
-        fut["ai"] = np.clip(fut["ai"], 0, 3.0)
-        fut["pann"] = np.clip(fut["pann"], 0, None)
-        return fut
-    fut30, fut50 = project(slope30), project(slope50)
-
-    # ---- Train soil-temp model on observed points ----
-    print("Training soil-temperature model...")
-    obs = pd.read_csv(OBS_CSV)
-    obs["AnnualTs"] = pd.to_numeric(obs["AnnualTs"], errors="coerce")
-    obs = obs.dropna(subset=["longitude", "latitude", "AnnualTs"]).reset_index(drop=True)
-    Xobs = {k: sample_grid(base[k], lat, lon, obs["latitude"].values,
-                           obs["longitude"].values) for k in FEATURE_COLS}
-    Xobs = pd.DataFrame(Xobs)
-    y = obs["AnnualTs"].to_numpy(dtype=float)
-    keep = np.asarray(Xobs.notna().all(axis=1))
-    Xobs, y = Xobs[keep], y[keep]
-    print(f"  {len(y)} of {len(obs)} obs points have valid climate features.")
-
-    from sklearn.ensemble import HistGradientBoostingRegressor
-    from sklearn.model_selection import cross_val_predict, KFold
+    from xgboost import XGBRegressor
+    from sklearn.model_selection import GroupKFold, cross_val_predict
     from sklearn.metrics import r2_score, mean_squared_error
 
-    def evaluate(cols, tag):
-        model = HistGradientBoostingRegressor(max_depth=4, learning_rate=0.08,
-                                              max_iter=400, random_state=0)
-        cv = KFold(5, shuffle=True, random_state=0)
-        pred = cross_val_predict(model, Xobs[cols], y, cv=cv)
+    def make_model():
+        return XGBRegressor(n_estimators=400, max_depth=6, learning_rate=0.05,
+                            subsample=0.8, colsample_bytree=0.8,
+                            tree_method="hist", n_jobs=-1, random_state=0)
+
+    def evaluate(cols_idx, tag):
+        gkf = GroupKFold(n_splits=5)
+        pred = cross_val_predict(make_model(), X[:, cols_idx], y,
+                                 cv=gkf, groups=groups)
         r2 = r2_score(y, pred)
         rmse = float(np.sqrt(mean_squared_error(y, pred)))
-        print(f"  [{tag}] 5-fold CV  R2={r2:.3f}  RMSE={rmse:.2f} C")
-        return r2, rmse
+        print(f"  [{tag}] held-out-year CV  R2={r2:.3f}  RMSE={rmse:.2f} C")
+        return round(r2, 3), round(rmse, 2)
 
-    r2_full, rmse_full = evaluate(FEATURE_COLS, "with air temp")
-    cols_noair = [c for c in FEATURE_COLS if c not in ("tmean", "twarm", "tcold")]
-    r2_noair, rmse_noair = evaluate(cols_noair, "without air temp")
+    print("Validating (GroupKFold by year)...")
+    all_idx = list(range(len(FEATURE_COLS)))
+    r2_full, rmse_full = evaluate(all_idx, "with air temp")
+    noair = [i for i, k in enumerate(FEATURE_COLS) if k not in ("tmean", "twarm", "tcold")]
+    r2_noair, rmse_noair = evaluate(noair, "without air temp")
 
-    # Final model on all data, applied to the grid (fit on plain arrays so grid
-    # prediction with numpy doesn't warn about missing feature names)
-    Xobs_arr = Xobs[FEATURE_COLS].to_numpy()
-    final = HistGradientBoostingRegressor(max_depth=4, learning_rate=0.08,
-                                          max_iter=400, random_state=0).fit(Xobs_arr, y)
+    print("Fitting final model on all rows...")
+    model = make_model().fit(X, y)
 
-    def predict_grid(fdict):
-        stack = np.stack([fdict[k].ravel() for k in FEATURE_COLS], axis=1)
-        ok = np.isfinite(stack).all(axis=1)
-        out = np.full(stack.shape[0], np.nan, dtype="float32")
-        out[ok] = final.predict(stack[ok])
-        return out.reshape(base["tmean"].shape)
+    # ---- Feature projection (per-cell trend, recent 30-yr and full 50-yr) ----
+    print("Computing feature trends + projections...")
+    base = {k: np.nanmean(feats[k][years >= BASELINE_START], axis=0) for k in FEATURE_COLS}
+    s30 = {k: ols_slope(feats[k][years >= BASELINE_START], years[years >= BASELINE_START])
+           for k in FEATURE_COLS}
+    s50 = {k: ols_slope(feats[k][years >= RATE50_START], years[years >= RATE50_START])
+           for k in FEATURE_COLS}
+    RATES = {"r30": s30, "r50": s50}
 
-    print("Predicting soil temperature (present, future)...")
-    st_present = predict_grid(base)
-    st_future = predict_grid(fut30)
-    st_future_low = predict_grid(fut50)
-
-    # ---- Habitability (present & future) ----
-    print("Computing habitability index + validating...")
-    hab_present = habitability(base["tmean"], base["ai"])
-    hab_future = habitability(fut30["tmean"], fut30["ai"])
-    hab_future_low = habitability(fut50["tmean"], fut50["ai"])
-
-    # Reference-region validation
-    val_rows = []
-    for rlat, rlon, label, hi in REFERENCE_REGIONS:
-        v = float(sample_grid(hab_present, lat, lon,
-                              np.array([rlat]), np.array([rlon]))[0])
-        val_rows.append((label, hi, v))
-    hi_vals = [v for _, hi, v in val_rows if hi]
-    lo_vals = [v for _, hi, v in val_rows if not hi]
-    sep = float(np.nanmean(hi_vals) - np.nanmean(lo_vals))
-    print("  Reference-region habitability (1=best):")
-    for label, hi, v in val_rows:
-        print(f"    {'FARM ' if hi else 'BARREN'}  {v:0.2f}  {label}")
-    print(f"  Mean(farmland)={np.nanmean(hi_vals):.2f}  "
-          f"Mean(barren)={np.nanmean(lo_vals):.2f}  separation={sep:+.2f}")
-
-    # ---- Save outputs ----
-    print("Writing outputs/ ...")
-    lon180 = ((lon + 180) % 360) - 180
-    order = np.argsort(lon180)
-    lon_sorted = lon180[order]
-    LON, LAT = np.meshgrid(lon_sorted, lat)
-
-    def col(field):
-        return field[:, order].ravel()
-
-    grid = pd.DataFrame({
-        "lat": LAT.ravel(), "lon": LON.ravel(),
-        "soil_temp_present": col(st_present),
-        "soil_temp_future": col(st_future),
-        "soil_temp_future_low": col(st_future_low),
-        "habitability_present": col(hab_present),
-        "habitability_future": col(hab_future),
-        "habitability_future_low": col(hab_future_low),
-    }).dropna(subset=["soil_temp_present"]).reset_index(drop=True)
-    grid.to_parquet(f"{OUT_DIR}/predictions_grid.parquet", index=False)
-    print(f"  predictions_grid.parquet  ({len(grid):,} land cells)")
-
-    # -----------------------------------------------------------------------
-    # ANIMATED OUTPUTS for the app: per-year overlay grid + observed-point
-    # time series. Past years (<= YEAR_END) use the ACTUAL historical climate
-    # of that year (real data, so they wiggle); future years are projected under
-    # BOTH the recent 30-yr rate ("r30") and the full 50-yr rate ("r50") so the
-    # app can offer a warming-rate toggle. Historical rows are tagged "hist".
-    # -----------------------------------------------------------------------
-    print("Building animated per-year outputs (real history + 30yr/50yr projections)...")
-    HIST_YEARS = list(range(1970, YEAR_END + 1, 5))      # real climate
-    FUT_YEARS = list(range(2020, 2081, 5))               # projected
-    RATES = {"r30": slope30, "r50": slope50}
-
-    # jobs: (year, rate_tag, slope_dict). Historical years computed once.
-    jobs = [(y, "hist", slope30) for y in HIST_YEARS]
-    jobs += [(y, tag, sl) for y in FUT_YEARS for tag, sl in RATES.items()]
-
-    def features_for(year, slope):
-        """Full-grid feature dict: real climate if historical, else trend."""
-        if year <= YEAR_END:
-            idx = year - YEAR_START
-            return {k: feats[k][idx] for k in FEATURE_COLS}
+    def project(slope, year):
         dt = year - BASELINE_MID
         fd = {k: base[k] + slope[k] * dt for k in FEATURE_COLS}
         fd["ai"] = np.clip(fd["ai"], 0, 3.0)
         fd["pann"] = np.clip(fd["pann"], 0, None)
         return fd
 
-    # Thinned overlay cells (~1.5 deg) so the browser animation stays smooth.
-    flat_lat, flat_lon = LAT.ravel(), LON.ravel()
-    thin = (np.round(flat_lat / 1.5) * 1.5) * 1000 + np.round(flat_lon / 1.5) * 1.5
-    base_t_flat = col(base["tmean"])
-    keepdf = pd.DataFrame({"k": thin, "i": np.arange(flat_lat.size),
-                           "ok": np.isfinite(base_t_flat)})
-    keep_idx = keepdf[keepdf["ok"]].groupby("k")["i"].first().to_numpy()
+    def predict_field(fdict):
+        stack = np.stack([fdict[k][landmask] for k in FEATURE_COLS], axis=-1)
+        out = np.full(landmask.shape, np.nan, dtype="float32")
+        out[landmask] = model.predict(stack)
+        return out
 
-    overlay_rows = []
-    for yr, tag, sl in jobs:
-        fd = features_for(yr, sl)
-        st_y = col(predict_grid(fd))[keep_idx]
-        hb_y = col(habitability(fd["tmean"], fd["ai"]))[keep_idx]
-        ha_y = col(heat_aridity_suit(fd["tmean"], fd["ai"]))[keep_idx]
-        overlay_rows.append(pd.DataFrame({
-            "lat": flat_lat[keep_idx], "lon": flat_lon[keep_idx], "year": yr,
-            "rate": tag, "soil_temp": st_y, "habitability": hb_y,
-            "heat_aridity": ha_y, "is_future": yr > YEAR_END,
-        }))
-    overlay = pd.concat(overlay_rows, ignore_index=True).dropna(subset=["soil_temp"])
+    # ---- Build animation frames on the land grid ----
+    ii, jj = np.where(landmask)
+    lon180 = ((lon + 180) % 360) - 180
+    cell_lat, cell_lon = lat[ii], lon180[jj]
+
+    def frame_rows(year, rate, soil_field, feat_for_overlays, is_future):
+        st = soil_field[ii, jj]
+        tm = feat_for_overlays["tmean"][ii, jj]
+        ai = feat_for_overlays["ai"][ii, jj]
+        return pd.DataFrame({
+            "lat": cell_lat, "lon": cell_lon, "year": year, "rate": rate,
+            "soil_temp": st,
+            "habitability": habitability(tm, ai),
+            "heat_aridity": heat_aridity_suit(tm, ai),
+            "is_future": is_future,
+        })
+
+    print("Assembling overlay grid (real past + projected future)...")
+    rows = []
+    for yr in HIST_YEARS:                                # real soil temp
+        idx = yr - YEAR_START
+        feat_yr = {k: feats[k][idx] for k in FEATURE_COLS}
+        rows.append(frame_rows(yr, "hist", soil[idx], feat_yr, False))
+    for yr in FUT_YEARS:                                 # modelled
+        for tag, slope in RATES.items():
+            fd = project(slope, yr)
+            rows.append(frame_rows(yr, tag, predict_field(fd), fd, True))
+    overlay = pd.concat(rows, ignore_index=True).dropna(subset=["soil_temp"])
     overlay.to_parquet(f"{OUT_DIR}/overlay_grid.parquet", index=False)
-    print(f"  overlay_grid.parquet  ({len(keep_idx):,} cells x {len(jobs)} year/rate frames)")
+    print(f"  overlay_grid.parquet  ({len(ii):,} land cells x "
+          f"{len(HIST_YEARS) + 2 * len(FUT_YEARS)} frames)")
 
-    # Observed-point soil temp per year: anchor to the REAL measured value and
-    # add the model's change relative to baseline (real-climate change for the
-    # past, trend change for the future) -> at baseline it equals the data.
-    plat, plon = obs["latitude"].to_numpy(), obs["longitude"].to_numpy()
-    obs_ts = obs["AnnualTs"].to_numpy()
-    base_pt = {k: sample_grid(base[k], lat, lon, plat, plon) for k in FEATURE_COLS}
-    slope_pt = {tag: {k: sample_grid(sl[k], lat, lon, plat, plon) for k in FEATURE_COLS}
-                for tag, sl in RATES.items()}
-    modeled_base = final.predict(np.column_stack([base_pt[k] for k in FEATURE_COLS]))
-    point_rows = []
-    for yr, tag, sl in jobs:
-        if yr <= YEAR_END:
-            idx = yr - YEAR_START
-            fpt = {k: sample_grid(feats[k][idx], lat, lon, plat, plon) for k in FEATURE_COLS}
-        else:
-            dt = yr - BASELINE_MID
-            spt = slope_pt[tag]
-            fpt = {k: base_pt[k] + spt[k] * dt for k in FEATURE_COLS}
-            fpt["ai"] = np.clip(fpt["ai"], 0, 3.0)
-            fpt["pann"] = np.clip(fpt["pann"], 0, None)
-        modeled = final.predict(np.column_stack([fpt[k] for k in FEATURE_COLS]))
-        point_rows.append(pd.DataFrame({
-            "lat": plat, "lon": plon, "year": yr, "rate": tag,
-            "soil_temp": obs_ts + (modeled - modeled_base),
-            "is_future": yr > YEAR_END,
-        }))
-    points_ts = pd.concat(point_rows, ignore_index=True)
-    points_ts.to_parquet(f"{OUT_DIR}/points_timeseries.parquet", index=False)
-    print(f"  points_timeseries.parquet  ({len(obs_ts):,} points x {len(jobs)} frames)")
-
-    obs_out = obs.iloc[np.flatnonzero(keep)].copy()
-    obs_out["soil_temp_pred_present"] = final.predict(Xobs_arr)
-    obs_out.to_csv(f"{OUT_DIR}/points_predictions.csv", index=False)
+    # ---- Observed Restor points -> nearest NCEP cell ----
+    print("Mapping Restor points to nearest cells...")
+    obs = pd.read_csv(OBS_CSV).dropna(subset=["longitude", "latitude"]).reset_index(drop=True)
+    pilat, pilon = nearest_idx(lat, lon, obs["latitude"].to_numpy(), obs["longitude"].to_numpy())
+    prows = []
+    for yr in HIST_YEARS:
+        st = soil[yr - YEAR_START][pilat, pilon]
+        prows.append(pd.DataFrame({"lat": obs["latitude"], "lon": obs["longitude"],
+                                   "year": yr, "rate": "hist", "soil_temp": st,
+                                   "is_future": False}))
+    for yr in FUT_YEARS:
+        for tag, slope in RATES.items():
+            field = predict_field(project(slope, yr))
+            st = field[pilat, pilon]
+            prows.append(pd.DataFrame({"lat": obs["latitude"], "lon": obs["longitude"],
+                                       "year": yr, "rate": tag, "soil_temp": st,
+                                       "is_future": True}))
+    points = pd.concat(prows, ignore_index=True).dropna(subset=["soil_temp"])
+    points.to_parquet(f"{OUT_DIR}/points_timeseries.parquet", index=False)
+    print(f"  points_timeseries.parquet  ({len(obs):,} points x frames)")
 
     metrics = {
-        "soil_temp_cv_r2_with_airtemp": round(r2_full, 3),
-        "soil_temp_cv_rmse_with_airtemp": round(rmse_full, 2),
-        "soil_temp_cv_r2_without_airtemp": round(r2_noair, 3),
-        "soil_temp_cv_rmse_without_airtemp": round(rmse_noair, 2),
-        "habitability_validation_mean_farmland": round(float(np.nanmean(hi_vals)), 3),
-        "habitability_validation_mean_barren": round(float(np.nanmean(lo_vals)), 3),
-        "habitability_validation_separation": round(sep, 3),
-        "future_year": FUTURE_YEAR,
-        "baseline_period": f"{BASELINE_START}-{YEAR_END}",
-        "n_obs_used": int(len(y)),
+        "soil_temp_cv_r2_with_airtemp": r2_full,
+        "soil_temp_cv_rmse_with_airtemp": rmse_full,
+        "soil_temp_cv_r2_without_airtemp": r2_noair,
+        "soil_temp_cv_rmse_without_airtemp": rmse_noair,
+        "n_train_rows": int(len(y)),
+        "train_years": f"{YEAR_START}-{YEAR_END}",
+        "grid": "NCEP ~1.9 deg",
     }
     with open(f"{OUT_DIR}/metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
-
-    # ---- PNG maps ----
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    def save_map(field, title, fname, cmap, vmin, vmax):
-        fig, ax = plt.subplots(figsize=(11, 5))
-        m = ax.pcolormesh(lon_sorted, lat, field[:, order], cmap=cmap,
-                          vmin=vmin, vmax=vmax, shading="auto")
-        ax.set_title(title); ax.set_xlabel("lon"); ax.set_ylabel("lat")
-        fig.colorbar(m, ax=ax, shrink=0.8)
-        fig.tight_layout(); fig.savefig(f"{OUT_DIR}/{fname}", dpi=110)
-        plt.close(fig)
-
-    save_map(st_present, "Predicted soil temperature - present (C)",
-             "soiltemp_present.png", "RdYlBu_r", -10, 35)
-    save_map(st_future, f"Predicted soil temperature - ~{FUTURE_YEAR} (C)",
-             "soiltemp_future.png", "RdYlBu_r", -10, 35)
-    save_map(st_future - st_present, f"Soil temp change by ~{FUTURE_YEAR} (C)",
-             "soiltemp_delta.png", "Reds", 0, 4)
-    save_map(hab_present, "Habitability index - present (1=best)",
-             "habitability_present.png", "YlGn", 0, 1)
-    save_map(hab_future, f"Habitability index - ~{FUTURE_YEAR}",
-             "habitability_future.png", "YlGn", 0, 1)
-    save_map(hab_future - hab_present, f"Habitability change by ~{FUTURE_YEAR}",
-             "habitability_delta.png", "RdBu", -0.5, 0.5)
-
     print("Done. Metrics:")
     print(json.dumps(metrics, indent=2))
 
