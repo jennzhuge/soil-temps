@@ -23,6 +23,9 @@ import os
 import numpy as np
 import pandas as pd
 import xarray as xr
+from xgboost import XGBRegressor
+from sklearn.model_selection import GroupKFold, cross_val_predict
+from sklearn.metrics import r2_score, mean_squared_error
 
 from soil_lib import FEATURE_COLS, habitability, heat_aridity_suit
 
@@ -161,10 +164,6 @@ def main():
     ok = np.isfinite(y)                                 # all land/years are finite
     X, y, groups = X[ok], y[ok], yr_grid[ok]
     print(f"  training rows: {len(y):,}")
-
-    from xgboost import XGBRegressor
-    from sklearn.model_selection import GroupKFold, cross_val_predict
-    from sklearn.metrics import r2_score, mean_squared_error
 
     def make_model():
         return XGBRegressor(n_estimators=400, max_depth=6, learning_rate=0.05,
